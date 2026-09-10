@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,6 +9,7 @@ from playwright.sync_api import sync_playwright
 
 CONFIG_FILE = Path("config/products.json")
 STATE_FILE = Path("data/prices.json")
+DEBUG_DIR = Path("debug")
 
 NTFY_TOPIC = os.environ["NTFY_TOPIC"]
 NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
@@ -30,107 +30,70 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def extract_price_from_text(text):
-    """
-    Find Philippine peso prices such as:
-    ₱499
-    ₱499.00
-    ₱ 499
-    ₱1,299.00
-    """
+def debug_page(page, product_id):
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    patterns = [
-        r"₱\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
-        r"PHP\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)",
-    ]
+    print("\n========== DEBUG INFORMATION ==========")
+    print(f"Final URL: {page.url}")
+    print(f"Page title: {page.title()}")
 
-    for pattern in patterns:
-        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+    # Save screenshot
+    screenshot_file = DEBUG_DIR / f"{product_id}.png"
 
-        for value in matches:
-            try:
-                value = value.replace(",", "")
-                price = float(value)
+    page.screenshot(
+        path=str(screenshot_file),
+        full_page=True
+    )
 
-                # Ignore obviously unrelated tiny/huge numbers.
-                if 1 <= price <= 1_000_000:
-                    return price
+    print(f"Screenshot saved: {screenshot_file}")
 
-            except ValueError:
-                pass
+    # Save HTML
+    html_file = DEBUG_DIR / f"{product_id}.html"
 
-    return None
+    html = page.content()
 
+    html_file.write_text(
+        html,
+        encoding="utf-8"
+    )
 
-def extract_price(page):
-    # 1. Try itemprop="price"
+    print(f"HTML saved: {html_file}")
+
+    # Get visible text
     try:
-        locator = page.locator('meta[itemprop="price"]').first
+        text = page.locator("body").inner_text(
+            timeout=10000
+        )
 
-        if locator.count() > 0:
-            value = locator.get_attribute("content")
+        text_file = DEBUG_DIR / f"{product_id}.txt"
 
-            if value:
-                price = float(value.replace(",", ""))
-                if price > 0:
-                    return price
-    except Exception:
-        pass
+        text_file.write_text(
+            text,
+            encoding="utf-8"
+        )
 
-    # 2. Try JSON-LD Product/Offer data
-    try:
-        scripts = page.locator('script[type="application/ld+json"]').all_text_contents()
+        print(f"Text saved: {text_file}")
 
-        for raw in scripts:
-            try:
-                data = json.loads(raw)
+        print("\n----- PAGE TEXT PREVIEW -----")
+        print(text[:5000])
+        print("----- END PAGE TEXT PREVIEW -----")
 
-                objects = data if isinstance(data, list) else [data]
+    except Exception as e:
+        print(f"Could not retrieve page text: {e}")
 
-                for obj in objects:
-                    if not isinstance(obj, dict):
-                        continue
-
-                    offers = obj.get("offers")
-
-                    if isinstance(offers, dict):
-                        price = offers.get("price")
-
-                        if price:
-                            price = float(str(price).replace(",", ""))
-                            if price > 0:
-                                return price
-
-                    if isinstance(offers, list):
-                        for offer in offers:
-                            if isinstance(offer, dict) and offer.get("price"):
-                                price = float(
-                                    str(offer["price"]).replace(",", "")
-                                )
-
-                                if price > 0:
-                                    return price
-
-            except Exception:
-                continue
-
-    except Exception:
-        pass
-
-    # 3. Fall back to rendered page text
-    try:
-        text = page.locator("body").inner_text(timeout=10000)
-        return extract_price_from_text(text)
-    except Exception:
-        return None
+    print("=======================================\n")
 
 
 def get_product(page, product):
+    product_id = product["id"]
     url = product["url"]
 
-    print(f"\nChecking: {product['name']}")
+    print("\n")
+    print("=======================================")
+    print(f"Checking: {product['name']}")
     print(f"Store: {product['store']}")
     print(f"URL: {url}")
+    print("=======================================")
 
     try:
         page.goto(
@@ -139,30 +102,30 @@ def get_product(page, product):
             timeout=60000
         )
 
-        # Give client-side JavaScript time to render.
-        page.wait_for_timeout(5000)
+        print("Initial page loaded.")
 
-        title = page.title()
+        # Allow JavaScript and redirects to finish.
+        page.wait_for_timeout(10000)
 
-        price = extract_price(page)
-
-        if price is None:
-            return {
-                "success": False,
-                "error": "Price could not be detected",
-                "title": title,
-            }
+        debug_page(
+            page,
+            product_id
+        )
 
         return {
-            "success": True,
-            "title": title,
-            "price": price,
+            "success": False,
+            "error": "Debug run - price extraction disabled",
+            "title": page.title(),
+            "url": page.url
         }
 
     except Exception as e:
+
+        print(f"ERROR: {e}")
+
         return {
             "success": False,
-            "error": str(e),
+            "error": str(e)
         }
 
 
@@ -171,9 +134,9 @@ def send_ntfy(message):
         NTFY_URL,
         data=message.encode("utf-8"),
         headers={
-            "Title": "Shopee/Lazada Price Monitor",
+            "Title": "Price Monitor Debug",
             "Priority": "default",
-            "Tags": "shopping_cart",
+            "Tags": "mag",
         },
         timeout=30,
     )
@@ -182,14 +145,26 @@ def send_ntfy(message):
 
 
 def main():
-    config = load_json(CONFIG_FILE, {"products": []})
-    state = load_json(STATE_FILE, {"products": {}})
 
-    state.setdefault("products", {})
+    config = load_json(
+        CONFIG_FILE,
+        {"products": []}
+    )
+
+    state = load_json(
+        STATE_FILE,
+        {"products": {}}
+    )
+
+    state.setdefault(
+        "products",
+        {}
+    )
 
     results = []
 
     with sync_playwright() as p:
+
         browser = p.chromium.launch(
             headless=True
         )
@@ -201,84 +176,50 @@ def main():
                 "width": 1366,
                 "height": 768
             },
+            user_agent=(
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            )
         )
 
         page = context.new_page()
 
         for product in config["products"]:
-            result = get_product(page, product)
 
-            product_id = product["id"]
+            result = get_product(
+                page,
+                product
+            )
 
-            now = datetime.now(timezone.utc).isoformat()
-
-            if result["success"]:
-                price = result["price"]
-
-                print(
-                    f"FOUND PRICE: ₱{price:,.2f}"
-                )
-
-                product_state = state["products"].setdefault(
-                    product_id,
-                    {
-                        "history": []
-                    }
-                )
-
-                product_state.setdefault(
-                    "history",
-                    []
-                )
-
-                product_state["history"].append(
-                    {
-                        "timestamp": now,
-                        "price": price
-                    }
-                )
-
-                # Keep the last 100 price records.
-                product_state["history"] = (
-                    product_state["history"][-100:]
-                )
-
-                product_state["last_price"] = price
-                product_state["last_checked"] = now
-
-                results.append(
-                    f"🛒 {product['name']}\n"
-                    f"Store: {product['store'].title()}\n"
-                    f"Price: ₱{price:,.2f}"
-                )
-
-            else:
-                print(
-                    f"FAILED: {result.get('error')}"
-                )
-
-                results.append(
-                    f"❌ {product['name']}\n"
-                    f"Store: {product['store'].title()}\n"
-                    f"Unable to retrieve price.\n"
-                    f"Reason: {result.get('error', 'Unknown error')}"
-                )
+            results.append(
+                f"🛒 {product['name']}\n"
+                f"Store: {product['store'].title()}\n"
+                f"Final URL: {result.get('url', 'N/A')}\n"
+                f"Page title: {result.get('title', 'N/A')}\n"
+                f"Status: Debug information collected"
+            )
 
         browser.close()
 
-    save_json(STATE_FILE, state)
+    save_json(
+        STATE_FILE,
+        state
+    )
 
     message = (
-        "🛒 PRICE CHECK TEST\n\n"
+        "🔎 PRICE MONITOR DEBUG\n\n"
         + "\n\n".join(results)
     )
 
-    print("\nSending ntfy notification...")
-    print(message)
+    print("\nSending debug notification...")
 
     send_ntfy(message)
 
-    print("Done.")
+    print("Debug run completed.")
 
 
 if __name__ == "__main__":
