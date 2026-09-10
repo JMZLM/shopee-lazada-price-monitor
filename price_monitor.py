@@ -7,9 +7,9 @@ from pathlib import Path
 import requests
 
 
-# ---------------------------------------------------------
+# =========================================================
 # CONFIGURATION
-# ---------------------------------------------------------
+# =========================================================
 
 PRODUCTS_FILE = Path("config/products.json")
 STATE_FILE = Path("data/prices.json")
@@ -18,13 +18,17 @@ DEBUG_DIR = Path("debug")
 PRICEWATCHA_BASE = "https://pricewatcha.com/api/v1"
 NTFY_URL = "https://ntfy.sh"
 
-POLL_INTERVAL = 5
-MAX_POLLS = 8
+# Pricewatcha can take several minutes for slow marketplace pages.
+MAX_WAIT_SECONDS = 600
+
+# Polling interval starts at 5 seconds and gradually increases.
+INITIAL_POLL_INTERVAL = 5
+MAX_POLL_INTERVAL = 30
 
 
-# ---------------------------------------------------------
+# =========================================================
 # HELPERS
-# ---------------------------------------------------------
+# =========================================================
 
 def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -50,6 +54,7 @@ def safe_filename(value):
 
 
 def send_ntfy(title, message, priority="default", tags="shopping_cart"):
+
     topic = os.getenv("NTFY_TOPIC")
 
     if not topic:
@@ -74,12 +79,13 @@ def send_ntfy(title, message, priority="default", tags="shopping_cart"):
     response.raise_for_status()
 
 
-# ---------------------------------------------------------
+# =========================================================
 # PRICEWATCHA
-# ---------------------------------------------------------
+# =========================================================
 
 def track_product(url):
-    print(f"Sending product to Pricewatcha:")
+
+    print("Sending product to Pricewatcha:")
     print(url)
 
     response = requests.post(
@@ -99,6 +105,7 @@ def track_product(url):
 
 
 def get_job(job_id):
+
     response = requests.get(
         f"{PRICEWATCHA_BASE}/jobs/{job_id}",
         timeout=30,
@@ -112,42 +119,99 @@ def get_job(job_id):
     return response.json()
 
 
-def get_product(product_id):
-    response = requests.get(
-        f"{PRICEWATCHA_BASE}/products/{product_id}",
-        timeout=30,
-    )
+def wait_for_job(job_id):
 
-    print(f"Product response: {response.status_code}")
-    print(response.text)
+    print()
+    print(f"Waiting for Pricewatcha job: {job_id}")
 
-    response.raise_for_status()
+    start_time = time.time()
+    poll_interval = INITIAL_POLL_INTERVAL
+    attempt = 0
 
-    return response.json()
+    while True:
 
+        elapsed = time.time() - start_time
 
-def get_price_from_result(result):
-    product = result.get("product")
+        if elapsed >= MAX_WAIT_SECONDS:
+            raise RuntimeError(
+                f"Pricewatcha job exceeded "
+                f"{MAX_WAIT_SECONDS} seconds."
+            )
 
-    if not product:
-        return None
+        attempt += 1
 
-    price = product.get("current_price")
+        print(
+            f"Checking job "
+            f"(attempt {attempt}, "
+            f"elapsed {int(elapsed)}s)..."
+        )
 
-    if price is None:
-        return None
+        job = get_job(job_id)
 
-    try:
-        return float(price)
-    except (TypeError, ValueError):
-        return None
+        status = job.get("status")
+
+        print(f"Job status: {status}")
+
+        # -----------------------------------------
+        # COMPLETED
+        # -----------------------------------------
+
+        if status == "completed":
+
+            product_data = job.get("product")
+
+            if not product_data:
+                raise RuntimeError(
+                    "Pricewatcha job completed "
+                    "but returned no product data."
+                )
+
+            return product_data
+
+        # -----------------------------------------
+        # FAILED
+        # -----------------------------------------
+
+        if status == "failed":
+
+            error = job.get("error")
+
+            raise RuntimeError(
+                f"Pricewatcha scraper failed: {error}"
+            )
+
+        # -----------------------------------------
+        # STILL RUNNING
+        # -----------------------------------------
+
+        if status in ("queued", "running"):
+
+            print(
+                f"Job still {status}. "
+                f"Waiting {poll_interval} seconds..."
+            )
+
+            time.sleep(poll_interval)
+
+            # Gradually increase polling interval.
+            poll_interval = min(
+                poll_interval + 5,
+                MAX_POLL_INTERVAL
+            )
+
+            continue
+
+        # -----------------------------------------
+        # UNKNOWN STATUS
+        # -----------------------------------------
+
+        raise RuntimeError(
+            f"Unknown Pricewatcha job status: {status}\n"
+            f"Full response: {job}"
+        )
 
 
 def get_price(product):
-    """
-    Send the marketplace URL to Pricewatcha and retrieve
-    the current price.
-    """
 
     url = product["url"]
 
@@ -155,73 +219,50 @@ def get_price(product):
 
     status = result.get("status")
 
-    # Fast result
+    # ---------------------------------------------
+    # COMPLETED IMMEDIATELY
+    # ---------------------------------------------
+
     if status == "completed":
-        price = get_price_from_result(result)
 
-        if price is not None:
-            return {
-                "price": price,
-                "product_id": result["product"]["product_id"],
-                "product": result["product"],
-            }
+        product_data = result.get("product")
 
-    # Slow result
-    if status == "running":
+        if not product_data:
+            raise RuntimeError(
+                "Pricewatcha returned completed status "
+                "but no product data."
+            )
+
+        return product_data
+
+    # ---------------------------------------------
+    # ASYNC JOB
+    # ---------------------------------------------
+
+    if status in ("running", "queued"):
+
         job_id = result.get("job_id")
 
         if not job_id:
             raise RuntimeError(
-                "Pricewatcha returned running status without job_id."
+                "Pricewatcha returned an async status "
+                "but no job_id."
             )
 
-        print(f"Pricewatcha job started: {job_id}")
+        return wait_for_job(job_id)
 
-        for attempt in range(MAX_POLLS):
-            print(
-                f"Waiting for Pricewatcha job "
-                f"({attempt + 1}/{MAX_POLLS})..."
-            )
-
-            time.sleep(POLL_INTERVAL)
-
-            job = get_job(job_id)
-
-            job_status = job.get("status")
-
-            if job_status == "completed":
-                price = get_price_from_result(job)
-
-                if price is None:
-                    raise RuntimeError(
-                        "Pricewatcha completed the job but no price was returned."
-                    )
-
-                product_data = job.get("product", {})
-
-                return {
-                    "price": price,
-                    "product_id": product_data.get("product_id"),
-                    "product": product_data,
-                }
-
-            if job_status == "failed":
-                raise RuntimeError(
-                    f"Pricewatcha job failed: {job}"
-                )
-
-        raise RuntimeError(
-            "Pricewatcha job did not finish within the allowed time."
-        )
+    # ---------------------------------------------
+    # UNEXPECTED
+    # ---------------------------------------------
 
     raise RuntimeError(
         f"Unexpected Pricewatcha response: {result}"
     )
 
 
-# ---------------------------------------------------------
-# MAIN MONITOR
-# ---------------------------------------------------------
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
@@ -229,22 +270,41 @@ def main():
     print(" Shopee / Lazada Price Monitor")
     print("==========================================")
 
-    PRODUCTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    PRODUCTS_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    STATE_FILE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    DEBUG_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     config = load_json(PRODUCTS_FILE)
 
     if STATE_FILE.exists():
         state = load_json(STATE_FILE)
     else:
-        state = {"products": {}}
+        state = {
+            "products": {}
+        }
 
     products = config.get("products", [])
 
     if not products:
+
         print("No products configured.")
+
         return
+
+    # =====================================================
+    # CHECK EACH PRODUCT
+    # =====================================================
 
     for product in products:
 
@@ -263,14 +323,35 @@ def main():
 
         try:
 
-            result = get_price(product)
+            # ---------------------------------------------
+            # GET PRICE
+            # ---------------------------------------------
 
-            current_price = result["price"]
-            pricewatcha_product = result.get("product", {})
+            product_data = get_price(product)
 
-            print(f"CURRENT PRICE: ₱{current_price:,.2f}")
+            current_price = product_data.get(
+                "current_price"
+            )
 
-            # Save raw result for troubleshooting
+            if current_price is None:
+
+                raise RuntimeError(
+                    "Pricewatcha returned product data "
+                    "but no current_price."
+                )
+
+            current_price = float(current_price)
+
+            print()
+            print(
+                f"CURRENT PRICE: "
+                f"₱{current_price:,.2f}"
+            )
+
+            # ---------------------------------------------
+            # SAVE DEBUG DATA
+            # ---------------------------------------------
+
             debug_file = (
                 DEBUG_DIR /
                 f"{safe_filename(product_id)}.json"
@@ -281,62 +362,89 @@ def main():
                 {
                     "checked_at": now_iso(),
                     "config": product,
-                    "pricewatcha": pricewatcha_product,
-                },
+                    "pricewatcha": product_data,
+                }
             )
 
-            old_data = state["products"].get(product_id, {})
+            # ---------------------------------------------
+            # PREVIOUS STATE
+            # ---------------------------------------------
 
-            previous_price = old_data.get("current_price")
+            old_data = state["products"].get(
+                product_id,
+                {}
+            )
 
-            # ------------------------------------------
+            previous_price = old_data.get(
+                "current_price"
+            )
+
+            # ---------------------------------------------
             # PRICE HISTORY
-            # ------------------------------------------
+            # ---------------------------------------------
 
-            history = old_data.get("history", [])
+            history = old_data.get(
+                "history",
+                []
+            )
 
             history.append(
                 {
                     "timestamp": now_iso(),
-                    "price": current_price,
+                    "price": current_price
                 }
             )
 
-            # Keep last 500 price records
+            # Keep latest 500 records.
             history = history[-500:]
 
-            # ------------------------------------------
-            # UPDATE STATE
-            # ------------------------------------------
+            # ---------------------------------------------
+            # SAVE CURRENT STATE
+            # ---------------------------------------------
 
             state["products"][product_id] = {
+
                 "name": name,
+
                 "store": store,
+
                 "url": url,
+
                 "current_price": current_price,
+
                 "previous_price": previous_price,
+
                 "target_price": target_price,
-                "pricewatcha_product_id": result.get("product_id"),
+
+                "pricewatcha_product_id":
+                    product_data.get("product_id"),
+
                 "last_checked": now_iso(),
-                "history": history,
+
+                "history": history
             }
 
-            # ------------------------------------------
-            # PRICE DROP ALERT
-            # ------------------------------------------
+            # ---------------------------------------------
+            # PRICE DROP
+            # ---------------------------------------------
 
             if (
                 previous_price is not None
-                and current_price < previous_price
+                and current_price < float(previous_price)
             ):
 
-                drop = previous_price - current_price
+                drop = (
+                    float(previous_price)
+                    - current_price
+                )
 
                 message = (
                     f"{name}\n\n"
                     f"Store: {store}\n"
-                    f"Previous price: ₱{previous_price:,.2f}\n"
-                    f"New price: ₱{current_price:,.2f}\n"
+                    f"Previous price: "
+                    f"₱{float(previous_price):,.2f}\n"
+                    f"New price: "
+                    f"₱{current_price:,.2f}\n"
                     f"Drop: ₱{drop:,.2f}\n\n"
                     f"{url}"
                 )
@@ -345,50 +453,71 @@ def main():
                     title=f"Price Drop: {name}",
                     message=message,
                     priority="high",
-                    tags="chart_with_downwards_trend,shopping_cart",
+                    tags="chart_with_downwards_trend,shopping_cart"
                 )
 
-                print("PRICE DROP NOTIFICATION SENT.")
-
-            # ------------------------------------------
-            # TARGET PRICE ALERT
-            # ------------------------------------------
-
-            if (
-                target_price is not None
-                and current_price <= float(target_price)
-            ):
-
-                was_already_below_target = (
-                    previous_price is not None
-                    and previous_price <= float(target_price)
+                print(
+                    "PRICE DROP NOTIFICATION SENT."
                 )
 
-                if not was_already_below_target:
+            # ---------------------------------------------
+            # TARGET PRICE
+            # ---------------------------------------------
 
-                    message = (
-                        f"{name}\n\n"
-                        f"Store: {store}\n"
-                        f"Current price: ₱{current_price:,.2f}\n"
-                        f"Target price: ₱{float(target_price):,.2f}\n\n"
-                        f"Target price has been reached!\n\n"
-                        f"{url}"
+            if target_price is not None:
+
+                target_price = float(
+                    target_price
+                )
+
+                if current_price <= target_price:
+
+                    was_already_below = (
+                        previous_price is not None
+                        and float(previous_price)
+                        <= target_price
                     )
 
-                    send_ntfy(
-                        title=f"Target Price Reached: {name}",
-                        message=message,
-                        priority="high",
-                        tags="tada,shopping_cart",
-                    )
+                    if not was_already_below:
 
-                    print("TARGET PRICE NOTIFICATION SENT.")
+                        message = (
+                            f"{name}\n\n"
+                            f"Store: {store}\n"
+                            f"Current price: "
+                            f"₱{current_price:,.2f}\n"
+                            f"Target price: "
+                            f"₱{target_price:,.2f}\n\n"
+                            f"Target price has been reached!\n\n"
+                            f"{url}"
+                        )
+
+                        send_ntfy(
+                            title=(
+                                f"Target Price Reached: "
+                                f"{name}"
+                            ),
+                            message=message,
+                            priority="high",
+                            tags="tada,shopping_cart"
+                        )
+
+                        print(
+                            "TARGET PRICE "
+                            "NOTIFICATION SENT."
+                        )
 
         except Exception as e:
 
             print()
-            print(f"ERROR checking {name}:")
+            print(
+                f"ERROR checking {name}:"
+            )
+
             print(str(e))
+
+            # ---------------------------------------------
+            # SAVE ERROR
+            # ---------------------------------------------
 
             error_file = (
                 DEBUG_DIR /
@@ -401,17 +530,20 @@ def main():
                 f"Store: {store}\n"
                 f"URL: {url}\n\n"
                 f"ERROR:\n{e}\n",
-                encoding="utf-8",
+                encoding="utf-8"
             )
 
-            # Don't stop the other products
+            # Don't stop other products.
             continue
 
-    # ------------------------------------------
+    # =====================================================
     # SAVE STATE
-    # ------------------------------------------
+    # =====================================================
 
-    save_json(STATE_FILE, state)
+    save_json(
+        STATE_FILE,
+        state
+    )
 
     print()
     print("==========================================")
