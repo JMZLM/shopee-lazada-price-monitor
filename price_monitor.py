@@ -1,24 +1,32 @@
 import json
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from playwright.sync_api import sync_playwright
 
 
-CONFIG_FILE = Path("config/products.json")
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+PRODUCTS_FILE = Path("config/products.json")
 STATE_FILE = Path("data/prices.json")
 DEBUG_DIR = Path("debug")
 
-NTFY_TOPIC = os.environ["NTFY_TOPIC"]
-NTFY_URL = f"https://ntfy.sh/{NTFY_TOPIC}"
+PRICEWATCHA_BASE = "https://pricewatcha.com/api/v1"
+NTFY_URL = "https://ntfy.sh"
+
+POLL_INTERVAL = 5
+MAX_POLLS = 8
 
 
-def load_json(path, default):
-    if not path.exists():
-        return default
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
 
+def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -30,196 +38,385 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def debug_page(page, product_id):
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-    print("\n========== DEBUG INFORMATION ==========")
-    print(f"Final URL: {page.url}")
-    print(f"Page title: {page.title()}")
 
-    # Save screenshot
-    screenshot_file = DEBUG_DIR / f"{product_id}.png"
-
-    page.screenshot(
-        path=str(screenshot_file),
-        full_page=True
+def safe_filename(value):
+    return "".join(
+        c if c.isalnum() or c in "-_" else "_"
+        for c in value
     )
 
-    print(f"Screenshot saved: {screenshot_file}")
 
-    # Save HTML
-    html_file = DEBUG_DIR / f"{product_id}.html"
+def send_ntfy(title, message, priority="default", tags="shopping_cart"):
+    topic = os.getenv("NTFY_TOPIC")
 
-    html = page.content()
+    if not topic:
+        print("NTFY_TOPIC is not configured.")
+        return
 
-    html_file.write_text(
-        html,
-        encoding="utf-8"
-    )
+    url = f"{NTFY_URL}/{topic}"
 
-    print(f"HTML saved: {html_file}")
-
-    # Get visible text
-    try:
-        text = page.locator("body").inner_text(
-            timeout=10000
-        )
-
-        text_file = DEBUG_DIR / f"{product_id}.txt"
-
-        text_file.write_text(
-            text,
-            encoding="utf-8"
-        )
-
-        print(f"Text saved: {text_file}")
-
-        print("\n----- PAGE TEXT PREVIEW -----")
-        print(text[:5000])
-        print("----- END PAGE TEXT PREVIEW -----")
-
-    except Exception as e:
-        print(f"Could not retrieve page text: {e}")
-
-    print("=======================================\n")
-
-
-def get_product(page, product):
-    product_id = product["id"]
-    url = product["url"]
-
-    print("\n")
-    print("=======================================")
-    print(f"Checking: {product['name']}")
-    print(f"Store: {product['store']}")
-    print(f"URL: {url}")
-    print("=======================================")
-
-    try:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60000
-        )
-
-        print("Initial page loaded.")
-
-        # Allow JavaScript and redirects to finish.
-        page.wait_for_timeout(10000)
-
-        debug_page(
-            page,
-            product_id
-        )
-
-        return {
-            "success": False,
-            "error": "Debug run - price extraction disabled",
-            "title": page.title(),
-            "url": page.url
-        }
-
-    except Exception as e:
-
-        print(f"ERROR: {e}")
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-def send_ntfy(message):
     response = requests.post(
-        NTFY_URL,
-        data=message.encode("utf-8"),
+        url,
         headers={
-            "Title": "Price Monitor Debug",
-            "Priority": "default",
-            "Tags": "mag",
+            "Title": title,
+            "Priority": priority,
+            "Tags": tags,
         },
+        data=message.encode("utf-8"),
         timeout=30,
     )
+
+    print(f"ntfy response: {response.status_code}")
 
     response.raise_for_status()
 
 
+# ---------------------------------------------------------
+# PRICEWATCHA
+# ---------------------------------------------------------
+
+def track_product(url):
+    print(f"Sending product to Pricewatcha:")
+    print(url)
+
+    response = requests.post(
+        f"{PRICEWATCHA_BASE}/track",
+        json={
+            "url": url
+        },
+        timeout=40,
+    )
+
+    print(f"Track response: {response.status_code}")
+    print(response.text)
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_job(job_id):
+    response = requests.get(
+        f"{PRICEWATCHA_BASE}/jobs/{job_id}",
+        timeout=30,
+    )
+
+    print(f"Job response: {response.status_code}")
+    print(response.text)
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_product(product_id):
+    response = requests.get(
+        f"{PRICEWATCHA_BASE}/products/{product_id}",
+        timeout=30,
+    )
+
+    print(f"Product response: {response.status_code}")
+    print(response.text)
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def get_price_from_result(result):
+    product = result.get("product")
+
+    if not product:
+        return None
+
+    price = product.get("current_price")
+
+    if price is None:
+        return None
+
+    try:
+        return float(price)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_price(product):
+    """
+    Send the marketplace URL to Pricewatcha and retrieve
+    the current price.
+    """
+
+    url = product["url"]
+
+    result = track_product(url)
+
+    status = result.get("status")
+
+    # Fast result
+    if status == "completed":
+        price = get_price_from_result(result)
+
+        if price is not None:
+            return {
+                "price": price,
+                "product_id": result["product"]["product_id"],
+                "product": result["product"],
+            }
+
+    # Slow result
+    if status == "running":
+        job_id = result.get("job_id")
+
+        if not job_id:
+            raise RuntimeError(
+                "Pricewatcha returned running status without job_id."
+            )
+
+        print(f"Pricewatcha job started: {job_id}")
+
+        for attempt in range(MAX_POLLS):
+            print(
+                f"Waiting for Pricewatcha job "
+                f"({attempt + 1}/{MAX_POLLS})..."
+            )
+
+            time.sleep(POLL_INTERVAL)
+
+            job = get_job(job_id)
+
+            job_status = job.get("status")
+
+            if job_status == "completed":
+                price = get_price_from_result(job)
+
+                if price is None:
+                    raise RuntimeError(
+                        "Pricewatcha completed the job but no price was returned."
+                    )
+
+                product_data = job.get("product", {})
+
+                return {
+                    "price": price,
+                    "product_id": product_data.get("product_id"),
+                    "product": product_data,
+                }
+
+            if job_status == "failed":
+                raise RuntimeError(
+                    f"Pricewatcha job failed: {job}"
+                )
+
+        raise RuntimeError(
+            "Pricewatcha job did not finish within the allowed time."
+        )
+
+    raise RuntimeError(
+        f"Unexpected Pricewatcha response: {result}"
+    )
+
+
+# ---------------------------------------------------------
+# MAIN MONITOR
+# ---------------------------------------------------------
+
 def main():
 
-    config = load_json(
-        CONFIG_FILE,
-        {"products": []}
-    )
+    print("==========================================")
+    print(" Shopee / Lazada Price Monitor")
+    print("==========================================")
 
-    state = load_json(
-        STATE_FILE,
-        {"products": {}}
-    )
+    PRODUCTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
 
-    state.setdefault(
-        "products",
-        {}
-    )
+    config = load_json(PRODUCTS_FILE)
 
-    results = []
+    if STATE_FILE.exists():
+        state = load_json(STATE_FILE)
+    else:
+        state = {"products": {}}
 
-    with sync_playwright() as p:
+    products = config.get("products", [])
 
-        browser = p.chromium.launch(
-            headless=True
-        )
+    if not products:
+        print("No products configured.")
+        return
 
-        context = browser.new_context(
-            locale="en-PH",
-            timezone_id="Asia/Manila",
-            viewport={
-                "width": 1366,
-                "height": 768
-            },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(X11; Linux x86_64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/140.0.0.0 "
-                "Safari/537.36"
-            )
-        )
+    for product in products:
 
-        page = context.new_page()
+        product_id = product["id"]
+        name = product["name"]
+        store = product["store"]
+        url = product["url"]
+        target_price = product.get("target_price")
 
-        for product in config["products"]:
+        print()
+        print("------------------------------------------")
+        print(f"Product: {name}")
+        print(f"Store:   {store}")
+        print(f"URL:     {url}")
+        print("------------------------------------------")
 
-            result = get_product(
-                page,
-                product
-            )
+        try:
 
-            results.append(
-                f"🛒 {product['name']}\n"
-                f"Store: {product['store'].title()}\n"
-                f"Final URL: {result.get('url', 'N/A')}\n"
-                f"Page title: {result.get('title', 'N/A')}\n"
-                f"Status: Debug information collected"
+            result = get_price(product)
+
+            current_price = result["price"]
+            pricewatcha_product = result.get("product", {})
+
+            print(f"CURRENT PRICE: ₱{current_price:,.2f}")
+
+            # Save raw result for troubleshooting
+            debug_file = (
+                DEBUG_DIR /
+                f"{safe_filename(product_id)}.json"
             )
 
-        browser.close()
+            save_json(
+                debug_file,
+                {
+                    "checked_at": now_iso(),
+                    "config": product,
+                    "pricewatcha": pricewatcha_product,
+                },
+            )
 
-    save_json(
-        STATE_FILE,
-        state
-    )
+            old_data = state["products"].get(product_id, {})
 
-    message = (
-        "🔎 PRICE MONITOR DEBUG\n\n"
-        + "\n\n".join(results)
-    )
+            previous_price = old_data.get("current_price")
 
-    print("\nSending debug notification...")
+            # ------------------------------------------
+            # PRICE HISTORY
+            # ------------------------------------------
 
-    send_ntfy(message)
+            history = old_data.get("history", [])
 
-    print("Debug run completed.")
+            history.append(
+                {
+                    "timestamp": now_iso(),
+                    "price": current_price,
+                }
+            )
+
+            # Keep last 500 price records
+            history = history[-500:]
+
+            # ------------------------------------------
+            # UPDATE STATE
+            # ------------------------------------------
+
+            state["products"][product_id] = {
+                "name": name,
+                "store": store,
+                "url": url,
+                "current_price": current_price,
+                "previous_price": previous_price,
+                "target_price": target_price,
+                "pricewatcha_product_id": result.get("product_id"),
+                "last_checked": now_iso(),
+                "history": history,
+            }
+
+            # ------------------------------------------
+            # PRICE DROP ALERT
+            # ------------------------------------------
+
+            if (
+                previous_price is not None
+                and current_price < previous_price
+            ):
+
+                drop = previous_price - current_price
+
+                message = (
+                    f"{name}\n\n"
+                    f"Store: {store}\n"
+                    f"Previous price: ₱{previous_price:,.2f}\n"
+                    f"New price: ₱{current_price:,.2f}\n"
+                    f"Drop: ₱{drop:,.2f}\n\n"
+                    f"{url}"
+                )
+
+                send_ntfy(
+                    title=f"Price Drop: {name}",
+                    message=message,
+                    priority="high",
+                    tags="chart_with_downwards_trend,shopping_cart",
+                )
+
+                print("PRICE DROP NOTIFICATION SENT.")
+
+            # ------------------------------------------
+            # TARGET PRICE ALERT
+            # ------------------------------------------
+
+            if (
+                target_price is not None
+                and current_price <= float(target_price)
+            ):
+
+                was_already_below_target = (
+                    previous_price is not None
+                    and previous_price <= float(target_price)
+                )
+
+                if not was_already_below_target:
+
+                    message = (
+                        f"{name}\n\n"
+                        f"Store: {store}\n"
+                        f"Current price: ₱{current_price:,.2f}\n"
+                        f"Target price: ₱{float(target_price):,.2f}\n\n"
+                        f"Target price has been reached!\n\n"
+                        f"{url}"
+                    )
+
+                    send_ntfy(
+                        title=f"Target Price Reached: {name}",
+                        message=message,
+                        priority="high",
+                        tags="tada,shopping_cart",
+                    )
+
+                    print("TARGET PRICE NOTIFICATION SENT.")
+
+        except Exception as e:
+
+            print()
+            print(f"ERROR checking {name}:")
+            print(str(e))
+
+            error_file = (
+                DEBUG_DIR /
+                f"{safe_filename(product_id)}_error.txt"
+            )
+
+            error_file.write_text(
+                f"Time: {now_iso()}\n"
+                f"Product: {name}\n"
+                f"Store: {store}\n"
+                f"URL: {url}\n\n"
+                f"ERROR:\n{e}\n",
+                encoding="utf-8",
+            )
+
+            # Don't stop the other products
+            continue
+
+    # ------------------------------------------
+    # SAVE STATE
+    # ------------------------------------------
+
+    save_json(STATE_FILE, state)
+
+    print()
+    print("==========================================")
+    print("Price monitor finished.")
+    print("==========================================")
 
 
 if __name__ == "__main__":
