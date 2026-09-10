@@ -1,3 +1,21 @@
 {
-  "products": {}
+  "products": {
+    "shopee-vet-core-shampoo": {
+      "name": "Vet-Core Active Dog Shampoo (Deltamethrin) 400ml",
+      "store": "shopee",
+      "url": "https://shopee.ph/Vet-Core-Active-Dog-Shampoo-(Deltamethrin)-400ml-i.1233738599.25924854268",
+      "current_price": 370.0,
+      "previous_price": null,
+      "target_price": null,
+      "biggo_nindex": "ph_bid_shopeeph",
+      "biggo_product_id": "1233738599.25924854268",
+      "last_checked": "2026-09-10T05:16:54.031692+00:00",
+      "history": [
+        {
+          "timestamp": "2026-09-10T05:16:54.031684+00:00",
+          "price": 370.0
+        }
+      ]
+    }
+  }
 }
