@@ -1,0 +1,18 @@
+{
+  "products": [
+    {
+      "id": "lazada-vet-product",
+      "store": "lazada",
+      "name": "Lazada Test Product",
+      "url": "https://www.lazada.com.ph/products/i15417892202-s132673983283.html",
+      "target_price": null
+    },
+    {
+      "id": "shopee-vet-core-shampoo",
+      "store": "shopee",
+      "name": "Vet-Core Active Dog Shampoo (Deltamethrin) 400ml",
+      "url": "https://shopee.ph/Vet-Core-Active-Dog-Shampoo-(Deltamethrin)-400ml-i.1233738599.25924854268",
+      "target_price": null
+    }
+  ]
+}
