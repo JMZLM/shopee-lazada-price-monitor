@@ -1,0 +1,23 @@
+name: Price Monitor Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Send test notification
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl \
+            -H "Title: Price Monitor Test" \
+            -H "Priority: default" \
+            -H "Tags: shopping_cart" \
+            -d "Shopee/Lazada price monitor is connected successfully." \
+            "https://ntfy.sh/$NTFY_TOPIC"
