@@ -1,6 +1,8 @@
 name: Price Monitor Test
 
 on:
+  repository_dispatch:
+    types: [price-check]
   workflow_dispatch:
 
 permissions:
@@ -19,5 +21,5 @@ jobs:
             -H "Title: Price Monitor Test" \
             -H "Priority: default" \
             -H "Tags: shopping_cart" \
-            -d "Shopee/Lazada price monitor is connected successfully." \
+            -d "External cron successfully triggered GitHub Actions." \
             "https://ntfy.sh/$NTFY_TOPIC"
