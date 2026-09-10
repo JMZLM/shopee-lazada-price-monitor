@@ -1,29 +1,71 @@
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 import requests
 
 
 # =========================================================
-# CONFIGURATION
+# FILES
 # =========================================================
 
 PRODUCTS_FILE = Path("config/products.json")
 STATE_FILE = Path("data/prices.json")
 DEBUG_DIR = Path("debug")
 
-PRICEWATCHA_BASE = "https://pricewatcha.com/api/v1"
+
+# =========================================================
+# BIGGO
+# =========================================================
+
+BIGGO_REGION = "ph"
+BIGGO_DOMAIN = "ph.biggo.com"
+
+BIGGO_STORE_LOOKUP = (
+    "https://extension.biggo.com/api/store.php"
+)
+
+BIGGO_ECLIST = (
+    "https://extension.biggo.com/api/eclist.php"
+)
+
+BIGGO_PRICE_HISTORY = (
+    "https://extension.biggo.com/api/product_price_history.php"
+)
+
+BIGGO_SEARCH = (
+    "https://api.biggo.com/api/v1/spa/search"
+)
+
+
+# =========================================================
+# NTFY
+# =========================================================
+
 NTFY_URL = "https://ntfy.sh"
 
-# Pricewatcha can take several minutes for slow marketplace pages.
-MAX_WAIT_SECONDS = 600
 
-# Polling interval starts at 5 seconds and gradually increases.
-INITIAL_POLL_INTERVAL = 5
-MAX_POLL_INTERVAL = 30
+# =========================================================
+# HTTP SESSION
+# =========================================================
+
+SESSION = requests.Session()
+
+SESSION.headers.update(
+    {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36"
+        )
+    }
+)
 
 
 # =========================================================
@@ -31,253 +73,600 @@ MAX_POLL_INTERVAL = 30
 # =========================================================
 
 def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
+
+    with open(
+        path,
+        "r",
+        encoding="utf-8"
+    ) as f:
         return json.load(f)
 
 
 def save_json(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    with open(
+        path,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            data,
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
 
 
 def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def safe_filename(value):
+
     return "".join(
         c if c.isalnum() or c in "-_" else "_"
         for c in value
     )
 
 
-def send_ntfy(title, message, priority="default", tags="shopping_cart"):
+# =========================================================
+# NTFY
+# =========================================================
+
+def send_ntfy(
+    title,
+    message,
+    priority="default",
+    tags="shopping_cart"
+):
 
     topic = os.getenv("NTFY_TOPIC")
 
     if not topic:
-        print("NTFY_TOPIC is not configured.")
+
+        print(
+            "NTFY_TOPIC is not configured."
+        )
+
         return
 
-    url = f"{NTFY_URL}/{topic}"
+    response = SESSION.post(
 
-    response = requests.post(
-        url,
+        f"{NTFY_URL}/{topic}",
+
         headers={
             "Title": title,
             "Priority": priority,
             "Tags": tags,
         },
-        data=message.encode("utf-8"),
-        timeout=30,
+
+        data=message.encode(
+            "utf-8"
+        ),
+
+        timeout=30
     )
 
-    print(f"ntfy response: {response.status_code}")
+    print(
+        f"ntfy response: "
+        f"{response.status_code}"
+    )
 
     response.raise_for_status()
 
 
 # =========================================================
-# PRICEWATCHA
+# BIGGO URL RESOLUTION
 # =========================================================
 
-def track_product(url):
+def get_biggo_store(url):
 
-    print("Sending product to Pricewatcha:")
-    print(url)
+    response = SESSION.get(
 
-    response = requests.post(
-        f"{PRICEWATCHA_BASE}/track",
-        json={
-            "url": url
+        BIGGO_STORE_LOOKUP,
+
+        params={
+            "method": "domain_lookup",
+            "domain": url,
         },
-        timeout=40,
+
+        timeout=30
     )
 
-    print(f"Track response: {response.status_code}")
-    print(response.text)
+    print(
+        "BigGo store lookup:",
+        response.status_code
+    )
 
     response.raise_for_status()
 
-    return response.json()
+    data = response.json()
 
-
-def get_job(job_id):
-
-    response = requests.get(
-        f"{PRICEWATCHA_BASE}/jobs/{job_id}",
-        timeout=30,
+    biggo_items = data.get(
+        "biggo",
+        []
     )
 
-    print(f"Job response: {response.status_code}")
-    print(response.text)
+    if not biggo_items:
 
-    response.raise_for_status()
-
-    return response.json()
-
-
-def wait_for_job(job_id):
-
-    print()
-    print(f"Waiting for Pricewatcha job: {job_id}")
-
-    start_time = time.time()
-    poll_interval = INITIAL_POLL_INTERVAL
-    attempt = 0
-
-    while True:
-
-        elapsed = time.time() - start_time
-
-        if elapsed >= MAX_WAIT_SECONDS:
-            raise RuntimeError(
-                f"Pricewatcha job exceeded "
-                f"{MAX_WAIT_SECONDS} seconds."
-            )
-
-        attempt += 1
-
-        print(
-            f"Checking job "
-            f"(attempt {attempt}, "
-            f"elapsed {int(elapsed)}s)..."
+        raise RuntimeError(
+            "BigGo could not identify "
+            f"this marketplace URL:\n{url}"
         )
 
-        job = get_job(job_id)
+    # Prefer PH result.
+    for item in biggo_items:
 
-        status = job.get("status")
+        if item.get("region") == "ph":
 
-        print(f"Job status: {status}")
+            return item["id"]
 
-        # -----------------------------------------
-        # COMPLETED
-        # -----------------------------------------
+    # Otherwise use first result.
+    return biggo_items[0]["id"]
 
-        if status == "completed":
 
-            product_data = job.get("product")
+# =========================================================
+# BIGGO EC LIST
+# =========================================================
 
-            if not product_data:
-                raise RuntimeError(
-                    "Pricewatcha job completed "
-                    "but returned no product data."
-                )
+def get_ec_list():
 
-            return product_data
+    response = SESSION.get(
+        BIGGO_ECLIST,
+        timeout=30
+    )
 
-        # -----------------------------------------
-        # FAILED
-        # -----------------------------------------
+    print(
+        "BigGo EC list:",
+        response.status_code
+    )
 
-        if status == "failed":
+    response.raise_for_status()
 
-            error = job.get("error")
+    data = response.json()
 
-            raise RuntimeError(
-                f"Pricewatcha scraper failed: {error}"
+    if not data.get("data"):
+
+        raise RuntimeError(
+            "BigGo returned an empty "
+            "e-commerce configuration list."
+        )
+
+    return data["data"]
+
+
+# =========================================================
+# URL PARSING
+# =========================================================
+
+def get_query_variable(
+    url,
+    field
+):
+
+    try:
+
+        parsed = urlparse(url)
+
+        params = parse_qs(
+            parsed.query
+        )
+
+        values = params.get(
+            field,
+            []
+        )
+
+        if values:
+
+            return values[0]
+
+    except Exception:
+
+        pass
+
+    return None
+
+
+def extract_id(
+    url,
+    pattern,
+    template="%1",
+    config=None
+):
+
+    match = re.search(
+        pattern,
+        url
+    )
+
+    if not match:
+
+        return None
+
+    groups = match.groups()
+
+    if not groups:
+
+        return None
+
+    pid = template
+
+    for index, value in enumerate(
+        groups,
+        start=1
+    ):
+
+        pid = pid.replace(
+            f"%{index}",
+            value
+        )
+
+    # Padding support used by BigGo.
+    if (
+        config
+        and config.get("len")
+        and "%p" in pid
+    ):
+
+        desired_length = config["len"]
+
+        current_length = (
+            len(pid.replace("%p", ""))
+        )
+
+        padding_length = (
+            desired_length
+            - current_length
+            + 2
+        )
+
+        if padding_length > 0:
+
+            pad = config.get(
+                "pad",
+                ""
             )
 
-        # -----------------------------------------
-        # STILL RUNNING
-        # -----------------------------------------
-
-        if status in ("queued", "running"):
-
-            print(
-                f"Job still {status}. "
-                f"Waiting {poll_interval} seconds..."
+            pid = pid.replace(
+                "%p",
+                str(pad) * padding_length
             )
 
-            time.sleep(poll_interval)
+    if (
+        config
+        and config.get("uppercase")
+    ):
 
-            # Gradually increase polling interval.
-            poll_interval = min(
-                poll_interval + 5,
-                MAX_POLL_INTERVAL
-            )
+        pid = pid.upper()
+
+    if (
+        config
+        and config.get("lowercase")
+    ):
+
+        pid = pid.lower()
+
+    return pid
+
+
+def parse_product_id(
+    url,
+    nindex,
+    ec_list
+):
+
+    region = nindex.split(
+        "_"
+    )[0]
+
+    region_config = ec_list.get(
+        region
+    )
+
+    if not region_config:
+
+        raise RuntimeError(
+            f"BigGo has no URL rules "
+            f"for region: {region}"
+        )
+
+    config = region_config.get(
+        nindex
+    )
+
+    if not config:
+
+        raise RuntimeError(
+            f"BigGo has no URL rules "
+            f"for store: {nindex}"
+        )
+
+    patterns = config.get(
+        "match",
+        ""
+    )
+
+    templates = config.get(
+        "template",
+        "%1"
+    )
+
+    if not isinstance(
+        patterns,
+        list
+    ):
+
+        patterns = [patterns]
+
+    if not isinstance(
+        templates,
+        list
+    ):
+
+        templates = [templates]
+
+    # Try regex patterns.
+    for index, pattern in enumerate(
+        patterns
+    ):
+
+        if not pattern:
 
             continue
 
-        # -----------------------------------------
-        # UNKNOWN STATUS
-        # -----------------------------------------
-
-        raise RuntimeError(
-            f"Unknown Pricewatcha job status: {status}\n"
-            f"Full response: {job}"
+        template = (
+            templates[index]
+            if index < len(templates)
+            else templates[0]
         )
 
+        pid = extract_id(
+            url,
+            pattern,
+            template,
+            config
+        )
 
-def get_price(product):
+        if pid:
 
-    url = product["url"]
+            return pid
 
-    result = track_product(url)
+    # Try query-string ID.
+    query_name = config.get(
+        "query",
+        ""
+    )
 
-    status = result.get("status")
+    if query_name:
 
-    # ---------------------------------------------
-    # COMPLETED IMMEDIATELY
-    # ---------------------------------------------
+        pid = get_query_variable(
+            url,
+            query_name
+        )
 
-    if status == "completed":
+        if pid:
 
-        product_data = result.get("product")
-
-        if not product_data:
-            raise RuntimeError(
-                "Pricewatcha returned completed status "
-                "but no product data."
-            )
-
-        return product_data
-
-    # ---------------------------------------------
-    # ASYNC JOB
-    # ---------------------------------------------
-
-    if status in ("running", "queued"):
-
-        job_id = result.get("job_id")
-
-        if not job_id:
-            raise RuntimeError(
-                "Pricewatcha returned an async status "
-                "but no job_id."
-            )
-
-        return wait_for_job(job_id)
-
-    # ---------------------------------------------
-    # UNEXPECTED
-    # ---------------------------------------------
+            return pid
 
     raise RuntimeError(
-        f"Unexpected Pricewatcha response: {result}"
+        "BigGo could not extract "
+        f"the product ID from:\n{url}"
     )
 
 
 # =========================================================
-# MAIN
+# BIGGO PRICE HISTORY
+# =========================================================
+
+def get_price_history(
+    nindex,
+    product_id
+):
+
+    history_id = (
+        f"{nindex}-{product_id}"
+    )
+
+    print(
+        f"BigGo history ID: "
+        f"{history_id}"
+    )
+
+    response = SESSION.post(
+
+        BIGGO_PRICE_HISTORY,
+
+        json={
+            "item": [
+                history_id
+            ],
+            "days": 180
+        },
+
+        timeout=30
+    )
+
+    print(
+        "BigGo price history:",
+        response.status_code
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("result") is False:
+
+        return None
+
+    return data
+
+
+def extract_current_price(
+    data,
+    history_id
+):
+
+    if not data:
+
+        return None
+
+    # BigGo returns the history data
+    # keyed by history ID.
+    item = data.get(
+        history_id
+    )
+
+    if not item:
+
+        # Sometimes the API may return
+        # another key. Try the first item.
+        values = list(
+            data.values()
+        )
+
+        if not values:
+
+            return None
+
+        item = values[0]
+
+    price = item.get(
+        "current_price"
+    )
+
+    if price is None:
+
+        return None
+
+    try:
+
+        return float(price)
+
+    except (
+        TypeError,
+        ValueError
+    ):
+
+        return None
+
+
+# =========================================================
+# GET PRICE FROM BIGGO
+# =========================================================
+
+def get_price(
+    product
+):
+
+    url = product["url"]
+
+    print()
+    print(
+        "Resolving URL through BigGo:"
+    )
+
+    print(url)
+
+    # -----------------------------------------------------
+    # Identify marketplace
+    # -----------------------------------------------------
+
+    nindex = get_biggo_store(
+        url
+    )
+
+    print(
+        f"BigGo store: {nindex}"
+    )
+
+    # -----------------------------------------------------
+    # Get BigGo marketplace rules
+    # -----------------------------------------------------
+
+    ec_list = get_ec_list()
+
+    # -----------------------------------------------------
+    # Extract marketplace product ID
+    # -----------------------------------------------------
+
+    product_id = parse_product_id(
+        url,
+        nindex,
+        ec_list
+    )
+
+    print(
+        f"BigGo product ID: "
+        f"{product_id}"
+    )
+
+    # -----------------------------------------------------
+    # Get price history
+    # -----------------------------------------------------
+
+    history_id = (
+        f"{nindex}-{product_id}"
+    )
+
+    data = get_price_history(
+        nindex,
+        product_id
+    )
+
+    current_price = (
+        extract_current_price(
+            data,
+            history_id
+        )
+    )
+
+    if current_price is None:
+
+        raise RuntimeError(
+            "BigGo recognized the product "
+            "but did not return a current price."
+        )
+
+    return {
+        "price": current_price,
+        "nindex": nindex,
+        "product_id": product_id,
+        "history_id": history_id,
+        "raw": data,
+    }
+
+
+# =========================================================
+# MAIN MONITOR
 # =========================================================
 
 def main():
 
-    print("==========================================")
-    print(" Shopee / Lazada Price Monitor")
-    print("==========================================")
-
-    PRODUCTS_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
+    print(
+        "=========================================="
     )
 
-    STATE_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True
+    print(
+        " Shopee / Lazada Price Monitor"
+    )
+
+    print(
+        " BigGo Price Source"
+    )
+
+    print(
+        "=========================================="
     )
 
     DEBUG_DIR.mkdir(
@@ -285,62 +674,85 @@ def main():
         exist_ok=True
     )
 
-    config = load_json(PRODUCTS_FILE)
-
-    if STATE_FILE.exists():
-        state = load_json(STATE_FILE)
-    else:
-        state = {
+    state = (
+        load_json(STATE_FILE)
+        if STATE_FILE.exists()
+        else {
             "products": {}
         }
+    )
 
-    products = config.get("products", [])
+    config = load_json(
+        PRODUCTS_FILE
+    )
+
+    products = config.get(
+        "products",
+        []
+    )
 
     if not products:
 
-        print("No products configured.")
+        print(
+            "No products configured."
+        )
 
         return
 
     # =====================================================
-    # CHECK EACH PRODUCT
+    # CHECK PRODUCTS
     # =====================================================
 
     for product in products:
 
         product_id = product["id"]
+
         name = product["name"]
+
         store = product["store"]
+
         url = product["url"]
-        target_price = product.get("target_price")
+
+        target_price = (
+            product.get(
+                "target_price"
+            )
+        )
 
         print()
-        print("------------------------------------------")
-        print(f"Product: {name}")
-        print(f"Store:   {store}")
-        print(f"URL:     {url}")
-        print("------------------------------------------")
+        print(
+            "------------------------------------------"
+        )
+
+        print(
+            f"Product: {name}"
+        )
+
+        print(
+            f"Store:   {store}"
+        )
+
+        print(
+            f"URL:     {url}"
+        )
+
+        print(
+            "------------------------------------------"
+        )
 
         try:
 
-            # ---------------------------------------------
+            # -------------------------------------------------
             # GET PRICE
-            # ---------------------------------------------
+            # -------------------------------------------------
 
-            product_data = get_price(product)
-
-            current_price = product_data.get(
-                "current_price"
+            result = get_price(
+                product
             )
 
-            if current_price is None:
-
-                raise RuntimeError(
-                    "Pricewatcha returned product data "
-                    "but no current_price."
-                )
-
-            current_price = float(current_price)
+            current_price = (
+                result["price"]
+            )
 
             print()
             print(
@@ -348,13 +760,13 @@ def main():
                 f"₱{current_price:,.2f}"
             )
 
-            # ---------------------------------------------
-            # SAVE DEBUG DATA
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # DEBUG
+            # -------------------------------------------------
 
             debug_file = (
-                DEBUG_DIR /
-                f"{safe_filename(product_id)}.json"
+                DEBUG_DIR
+                / f"{safe_filename(product_id)}.json"
             )
 
             save_json(
@@ -362,30 +774,36 @@ def main():
                 {
                     "checked_at": now_iso(),
                     "config": product,
-                    "pricewatcha": product_data,
+                    "biggo": result,
                 }
             )
 
-            # ---------------------------------------------
-            # PREVIOUS STATE
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # OLD STATE
+            # -------------------------------------------------
 
-            old_data = state["products"].get(
-                product_id,
-                {}
+            old_data = (
+                state["products"].get(
+                    product_id,
+                    {}
+                )
             )
 
-            previous_price = old_data.get(
-                "current_price"
+            previous_price = (
+                old_data.get(
+                    "current_price"
+                )
             )
 
-            # ---------------------------------------------
-            # PRICE HISTORY
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # HISTORY
+            # -------------------------------------------------
 
-            history = old_data.get(
-                "history",
-                []
+            history = (
+                old_data.get(
+                    "history",
+                    []
+                )
             )
 
             history.append(
@@ -395,12 +813,12 @@ def main():
                 }
             )
 
-            # Keep latest 500 records.
+            # Keep last 500 records.
             history = history[-500:]
 
-            # ---------------------------------------------
-            # SAVE CURRENT STATE
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # SAVE STATE
+            # -------------------------------------------------
 
             state["products"][product_id] = {
 
@@ -410,27 +828,36 @@ def main():
 
                 "url": url,
 
-                "current_price": current_price,
+                "current_price":
+                    current_price,
 
-                "previous_price": previous_price,
+                "previous_price":
+                    previous_price,
 
-                "target_price": target_price,
+                "target_price":
+                    target_price,
 
-                "pricewatcha_product_id":
-                    product_data.get("product_id"),
+                "biggo_nindex":
+                    result["nindex"],
 
-                "last_checked": now_iso(),
+                "biggo_product_id":
+                    result["product_id"],
 
-                "history": history
+                "last_checked":
+                    now_iso(),
+
+                "history":
+                    history
             }
 
-            # ---------------------------------------------
-            # PRICE DROP
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # PRICE DROP ALERT
+            # -------------------------------------------------
 
             if (
                 previous_price is not None
-                and current_price < float(previous_price)
+                and current_price
+                < float(previous_price)
             ):
 
                 drop = (
@@ -445,24 +872,31 @@ def main():
                     f"₱{float(previous_price):,.2f}\n"
                     f"New price: "
                     f"₱{current_price:,.2f}\n"
-                    f"Drop: ₱{drop:,.2f}\n\n"
+                    f"Drop: "
+                    f"₱{drop:,.2f}\n\n"
                     f"{url}"
                 )
 
                 send_ntfy(
-                    title=f"Price Drop: {name}",
+                    title=(
+                        f"Price Drop: {name}"
+                    ),
                     message=message,
                     priority="high",
-                    tags="chart_with_downwards_trend,shopping_cart"
+                    tags=(
+                        "chart_with_downwards_trend,"
+                        "shopping_cart"
+                    )
                 )
 
                 print(
-                    "PRICE DROP NOTIFICATION SENT."
+                    "PRICE DROP "
+                    "NOTIFICATION SENT."
                 )
 
-            # ---------------------------------------------
-            # TARGET PRICE
-            # ---------------------------------------------
+            # -------------------------------------------------
+            # TARGET PRICE ALERT
+            # -------------------------------------------------
 
             if target_price is not None:
 
@@ -470,10 +904,14 @@ def main():
                     target_price
                 )
 
-                if current_price <= target_price:
+                if (
+                    current_price
+                    <= target_price
+                ):
 
                     was_already_below = (
-                        previous_price is not None
+                        previous_price
+                        is not None
                         and float(previous_price)
                         <= target_price
                     )
@@ -487,18 +925,22 @@ def main():
                             f"₱{current_price:,.2f}\n"
                             f"Target price: "
                             f"₱{target_price:,.2f}\n\n"
-                            f"Target price has been reached!\n\n"
+                            f"Target price "
+                            f"has been reached!\n\n"
                             f"{url}"
                         )
 
                         send_ntfy(
                             title=(
-                                f"Target Price Reached: "
+                                "Target Price Reached: "
                                 f"{name}"
                             ),
                             message=message,
                             priority="high",
-                            tags="tada,shopping_cart"
+                            tags=(
+                                "tada,"
+                                "shopping_cart"
+                            )
                         )
 
                         print(
@@ -513,15 +955,13 @@ def main():
                 f"ERROR checking {name}:"
             )
 
-            print(str(e))
-
-            # ---------------------------------------------
-            # SAVE ERROR
-            # ---------------------------------------------
+            print(
+                str(e)
+            )
 
             error_file = (
-                DEBUG_DIR /
-                f"{safe_filename(product_id)}_error.txt"
+                DEBUG_DIR
+                / f"{safe_filename(product_id)}_error.txt"
             )
 
             error_file.write_text(
@@ -533,7 +973,7 @@ def main():
                 encoding="utf-8"
             )
 
-            # Don't stop other products.
+            # Continue to next product.
             continue
 
     # =====================================================
@@ -546,10 +986,19 @@ def main():
     )
 
     print()
-    print("==========================================")
-    print("Price monitor finished.")
-    print("==========================================")
+    print(
+        "=========================================="
+    )
+
+    print(
+        "Price monitor finished."
+    )
+
+    print(
+        "=========================================="
+    )
 
 
 if __name__ == "__main__":
+
     main()
